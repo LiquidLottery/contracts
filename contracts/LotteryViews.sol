@@ -266,6 +266,12 @@ library LotteryViews {
         emit OwnerFeesTopUp(msg.sender, msg.value);
     }
 
+    function seedJackpot() external {
+        LotteryStorage storage s = _s();
+        if (msg.value == 0) revert NoValueSent();
+        s.rounds[s.currentRound].jackpotPool += msg.value;
+    }
+
     function proposeSetUpkeepInterval(uint256 newInterval) external {
         if (newInterval == 0) revert IntervalMustBePositive();
         LotteryStorage storage s = _s();

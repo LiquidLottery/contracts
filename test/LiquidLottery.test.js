@@ -668,6 +668,77 @@ describe('LiquidLottery', function () {
         });
     });
 
+    describe('seedJackpot', function () {
+        it('admin can seed the jackpot', async function () {
+            const { lottery } = await loadFixture(deployFixture);
+
+            await lottery.seedJackpot({ value: ethers.parseEther('1') });
+
+            const info = await lottery.getRoundInfo(1);
+            expect(info.jackpotPool).to.equal(ethers.parseEther('1'));
+        });
+
+        it('non-admin cannot seed the jackpot', async function () {
+            const { lottery, alice } = await loadFixture(deployFixture);
+
+            await expect(
+                lottery.connect(alice).seedJackpot({ value: ethers.parseEther('1') }),
+            ).to.be.revertedWithCustomError(lottery, 'Unauthorized');
+        });
+
+        it('reverts with zero value', async function () {
+            const { lottery } = await loadFixture(deployFixture);
+
+            await expect(
+                lottery.seedJackpot({ value: 0n }),
+            ).to.be.revertedWithCustomError(lotteryViewsLib, 'NoValueSent');
+        });
+
+        it('seed accumulates across multiple calls', async function () {
+            const { lottery } = await loadFixture(deployFixture);
+
+            await lottery.seedJackpot({ value: ethers.parseEther('1') });
+            await lottery.seedJackpot({ value: ethers.parseEther('2') });
+
+            const info = await lottery.getRoundInfo(1);
+            expect(info.jackpotPool).to.equal(ethers.parseEther('3'));
+        });
+
+        it('seed increases ticketPrice', async function () {
+            const { lottery } = await loadFixture(deployFixture);
+
+            const priceBefore = await lottery.ticketPrice();
+
+            // Seed a large amount so the 0.05% calculation exceeds MIN_TICKET_PRICE
+            await lottery.seedJackpot({ value: ethers.parseEther('100') });
+
+            const priceAfter = await lottery.ticketPrice();
+            expect(priceAfter).to.be.gt(priceBefore);
+        });
+
+        it('seeded amount rolls over to round 2 when no winner', async function () {
+            const { lottery, mockVRF, alice } = await loadFixture(deployFixture);
+
+            // Seed round 1 jackpot
+            await lottery.seedJackpot({ value: ethers.parseEther('1') });
+
+            // Buy a ticket so the round can be drawn
+            const t = makeTicket([1, 2, 3, 4, 5], 10, 0);
+            await buyTickets(lottery, alice, [t]);
+
+            const infoBefore = await lottery.getRoundInfo(1);
+
+            // Complete round with no winner
+            await closeDraw(lottery);
+            await fulfillDraw(mockVRF, 1, NON_MATCHING_SEED);
+            await lottery.settleRound();
+
+            expect(await lottery.currentRound()).to.equal(2);
+            const info2 = await lottery.getRoundInfo(2);
+            expect(info2.jackpotPool).to.equal(infoBefore.jackpotPool);
+        });
+    });
+
     describe('CCIP fee deducted from ownerFees', function () {
         it('ownerFees is unchanged after draw when MockRouter fee is 0', async function () {
             const { lottery, mockVRF, alice } = await loadFixture(deployFixture);
@@ -2640,12 +2711,18 @@ describe('LiquidLottery', function () {
 
     describe('V2: GoldenTicket contract', function () {
         async function deployGoldenTicketFixture() {
-            const [owner, alice, bob] = await ethers.getSigners();
+            const base = await deployFixture();
+            const { lottery, owner, alice, bob } = base;
             const mintPrice = ethers.parseEther('0.1');
             const GoldenTicket = await ethers.getContractFactory('GoldenTicket');
             const nft = await GoldenTicket.deploy(mintPrice, 'https://example.com/meta/');
             await nft.waitForDeployment();
-            return { nft, owner, alice, bob, mintPrice };
+            // Unlock full supply so existing public-mint tests work as before
+            await nft.connect(owner).setMintableSupply(10);
+            // Wire: GoldenTicket → lottery (so mint() can call seedJackpot)
+            await nft.connect(owner).setLotteryContract(await lottery.getAddress());
+            await lottery.connect(owner).setGoldenTicketContract(await nft.getAddress());
+            return { ...base, nft, mintPrice };
         }
 
         it('should have correct name, symbol, and MAX_SUPPLY', async function () {
@@ -2696,17 +2773,19 @@ describe('LiquidLottery', function () {
             ).to.be.revertedWithCustomError(nft, 'AlreadyMintedOut');
         });
 
-        it('withdrawProceeds sends mint ETH to owner', async function () {
-            const { nft, owner, alice, mintPrice } = await loadFixture(deployGoldenTicketFixture);
+        it('mint forwards payment to jackpot pool (no proceeds in GoldenTicket)', async function () {
+            const { nft, lottery, owner, alice, mintPrice } = await loadFixture(deployGoldenTicketFixture);
+            const infoBefore = await lottery.getRoundInfo(1);
             await nft.connect(alice).mint({ value: mintPrice });
 
-            const balBefore = await ethers.provider.getBalance(owner.address);
-            const tx = await nft.connect(owner).withdrawProceeds();
-            const receipt = await tx.wait();
-            const gasCost = receipt.gasUsed * receipt.gasPrice;
-            const balAfter = await ethers.provider.getBalance(owner.address);
+            // Mint payment goes to jackpot pool, not to _proceeds
+            const infoAfter = await lottery.getRoundInfo(1);
+            expect(infoAfter.jackpotPool - infoBefore.jackpotPool).to.equal(mintPrice);
 
-            expect(balAfter - balBefore + gasCost).to.equal(mintPrice);
+            // withdrawProceeds reverts because _proceeds is 0
+            await expect(
+                nft.connect(owner).withdrawProceeds(),
+            ).to.be.revertedWithCustomError(nft, 'NoValueToWithdraw');
         });
 
         it('withdrawProceeds reverts when no proceeds', async function () {
@@ -2721,6 +2800,135 @@ describe('LiquidLottery', function () {
             await nft.connect(alice).mint({ value: mintPrice });
             await nft.connect(owner).setBaseURI('https://new-uri.com/');
             expect(await nft.tokenURI(0)).to.equal('https://new-uri.com/0');
+        });
+    });
+
+    describe('V2: GoldenTicket mintableSupply and pricing', function () {
+        async function deployGoldenTicketBaseFixture() {
+            const base = await deployFixture();
+            const { lottery, owner, alice, bob } = base;
+            const mintPrice = ethers.parseEther('2');
+            const GoldenTicket = await ethers.getContractFactory('GoldenTicket');
+            const nft = await GoldenTicket.deploy(mintPrice, 'https://example.com/meta/');
+            await nft.waitForDeployment();
+            // Wire: GoldenTicket → lottery (so mint() can call seedJackpot)
+            await nft.connect(owner).setLotteryContract(await lottery.getAddress());
+            await lottery.connect(owner).setGoldenTicketContract(await nft.getAddress());
+            // mintableSupply starts at 0 — not set here
+            return { ...base, nft, mintPrice };
+        }
+
+        it('mintableSupply starts at 0', async function () {
+            const { nft } = await loadFixture(deployGoldenTicketBaseFixture);
+            expect(await nft.mintableSupply()).to.equal(0);
+        });
+
+        it('mint() reverts when mintableSupply is 0', async function () {
+            const { nft, alice, mintPrice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await expect(
+                nft.connect(alice).mint({ value: mintPrice }),
+            ).to.be.revertedWithCustomError(nft, 'MintableSupplyReached');
+        });
+
+        it('setMintableSupply sets the value', async function () {
+            const { nft, owner } = await loadFixture(deployGoldenTicketBaseFixture);
+            await nft.connect(owner).setMintableSupply(3);
+            expect(await nft.mintableSupply()).to.equal(3);
+        });
+
+        it('setMintableSupply reverts for non-owner', async function () {
+            const { nft, alice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await expect(
+                nft.connect(alice).setMintableSupply(1),
+            ).to.be.revertedWithCustomError(nft, 'OwnableUnauthorizedAccount');
+        });
+
+        it('setMintableSupply reverts if n > MAX_SUPPLY', async function () {
+            const { nft, owner } = await loadFixture(deployGoldenTicketBaseFixture);
+            await expect(
+                nft.connect(owner).setMintableSupply(11),
+            ).to.be.revertedWithCustomError(nft, 'ExceedsMaxSupply');
+        });
+
+        it('mint() succeeds after setMintableSupply(1)', async function () {
+            const { nft, owner, alice, mintPrice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await nft.connect(owner).setMintableSupply(1);
+            await nft.connect(alice).mint({ value: mintPrice });
+            expect(await nft.ownerOf(0)).to.equal(alice.address);
+            expect(await nft.publicMinted()).to.equal(1);
+        });
+
+        it('mint() reverts after mintableSupply is reached', async function () {
+            const { nft, owner, alice, bob, mintPrice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await nft.connect(owner).setMintableSupply(1);
+            await nft.connect(alice).mint({ value: mintPrice });
+            await expect(
+                nft.connect(bob).mint({ value: mintPrice }),
+            ).to.be.revertedWithCustomError(nft, 'MintableSupplyReached');
+        });
+
+        it('setMintPrice updates the mint price', async function () {
+            const { nft, owner, alice } = await loadFixture(deployGoldenTicketBaseFixture);
+            const newPrice = ethers.parseEther('5');
+            await nft.connect(owner).setMintPrice(newPrice);
+            expect(await nft.mintPrice()).to.equal(newPrice);
+            await nft.connect(owner).setMintableSupply(1);
+            await nft.connect(alice).mint({ value: newPrice });
+            expect(await nft.ownerOf(0)).to.equal(alice.address);
+        });
+
+        it('setMintPrice reverts for non-owner', async function () {
+            const { nft, alice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await expect(
+                nft.connect(alice).setMintPrice(ethers.parseEther('1')),
+            ).to.be.revertedWithCustomError(nft, 'OwnableUnauthorizedAccount');
+        });
+
+        it('adminMint bypasses mintableSupply', async function () {
+            const { nft, owner, alice } = await loadFixture(deployGoldenTicketBaseFixture);
+            // mintableSupply is 0, adminMint still works
+            await nft.connect(owner).adminMint(alice.address);
+            expect(await nft.ownerOf(0)).to.equal(alice.address);
+            expect(await nft.totalMinted()).to.equal(1);
+            expect(await nft.publicMinted()).to.equal(0);
+        });
+
+        it('lotteryMint bypasses mintableSupply', async function () {
+            const { nft, owner, alice } = await loadFixture(deployGoldenTicketBaseFixture);
+            await nft.connect(owner).setLotteryContract(owner.address);
+            // mintableSupply is 0, lotteryMint still works
+            await nft.connect(owner).lotteryMint(alice.address);
+            expect(await nft.ownerOf(0)).to.equal(alice.address);
+            expect(await nft.publicMinted()).to.equal(0);
+        });
+
+        it('progressive mint flow: price 2 ETH then 5 ETH', async function () {
+            const { nft, owner, alice, bob } = await loadFixture(deployGoldenTicketBaseFixture);
+            const price1 = ethers.parseEther('2');
+            const price2 = ethers.parseEther('5');
+
+            // Step 1: Unlock 1 token at 2 ETH
+            await nft.connect(owner).setMintableSupply(1);
+            await nft.connect(alice).mint({ value: price1 });
+            expect(await nft.publicMinted()).to.equal(1);
+
+            // Step 2: Raise price to 5 ETH and unlock 2nd slot
+            await nft.connect(owner).setMintPrice(price2);
+            await nft.connect(owner).setMintableSupply(2);
+            await nft.connect(bob).mint({ value: price2 });
+            expect(await nft.publicMinted()).to.equal(2);
+            expect(await nft.ownerOf(1)).to.equal(bob.address);
+        });
+
+        it('adminMint does not count toward publicMinted', async function () {
+            const { nft, owner, alice, bob, mintPrice } = await loadFixture(deployGoldenTicketBaseFixture);
+            // adminMint pushes _totalMinted to 1 but _publicMinted stays 0
+            await nft.connect(owner).adminMint(alice.address);
+            // With mintableSupply=1, public mint should still work
+            await nft.connect(owner).setMintableSupply(1);
+            await nft.connect(bob).mint({ value: mintPrice });
+            expect(await nft.publicMinted()).to.equal(1);
+            expect(await nft.totalMinted()).to.equal(2);
         });
     });
 
@@ -3198,6 +3406,92 @@ describe('LiquidLottery', function () {
 
             expect(await nft.totalMinted()).to.equal(1);
             expect(await nft.ownerOf(0)).to.equal(alice.address);
+        });
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    //  V2: GoldenTicket mint → seedJackpot forwarding
+    // ═══════════════════════════════════════════════════════════════
+
+    describe('V2: GoldenTicket mint → seedJackpot', function () {
+        async function deployMintSeedFixture() {
+            const base = await deployFixture();
+            const { lottery, owner, alice, bob } = base;
+            const mintPrice = ethers.parseEther('1');
+            const GoldenTicket = await ethers.getContractFactory('GoldenTicket');
+            const nft = await GoldenTicket.deploy(mintPrice, '');
+            await nft.waitForDeployment();
+            await nft.connect(owner).setMintableSupply(10);
+            // Wire both sides
+            await nft.connect(owner).setLotteryContract(await lottery.getAddress());
+            await lottery.connect(owner).setGoldenTicketContract(await nft.getAddress());
+            return { ...base, nft, mintPrice };
+        }
+
+        it('GoldenTicket mint forwards HYPE to lottery jackpot', async function () {
+            const { lottery, nft, alice, mintPrice } = await loadFixture(deployMintSeedFixture);
+            const infoBefore = await lottery.getRoundInfo(1);
+
+            await nft.connect(alice).mint({ value: mintPrice });
+
+            const infoAfter = await lottery.getRoundInfo(1);
+            expect(infoAfter.jackpotPool - infoBefore.jackpotPool).to.equal(mintPrice);
+        });
+
+        it('GoldenTicket mint reverts if lotteryContract not set', async function () {
+            const { owner, alice } = await loadFixture(deployMintSeedFixture);
+            const mintPrice = ethers.parseEther('1');
+            const GoldenTicket = await ethers.getContractFactory('GoldenTicket');
+            const nftNoLottery = await GoldenTicket.deploy(mintPrice, '');
+            await nftNoLottery.waitForDeployment();
+            await nftNoLottery.connect(owner).setMintableSupply(10);
+            // lotteryContract is address(0) — mint must revert
+            await expect(
+                nftNoLottery.connect(alice).mint({ value: mintPrice }),
+            ).to.be.reverted;
+        });
+
+        it('multiple mints accumulate in jackpot', async function () {
+            const { lottery, nft, alice, bob, mintPrice } = await loadFixture(deployMintSeedFixture);
+            const infoBefore = await lottery.getRoundInfo(1);
+
+            await nft.connect(alice).mint({ value: mintPrice });
+            await nft.connect(bob).mint({ value: mintPrice });
+
+            const infoAfter = await lottery.getRoundInfo(1);
+            expect(infoAfter.jackpotPool - infoBefore.jackpotPool).to.equal(mintPrice * 2n);
+        });
+
+        it('seedJackpot callable by admin', async function () {
+            const { lottery } = await loadFixture(deployMintSeedFixture);
+            const infoBefore = await lottery.getRoundInfo(1);
+            const amount = ethers.parseEther('5');
+
+            await lottery.seedJackpot({ value: amount });
+
+            const infoAfter = await lottery.getRoundInfo(1);
+            expect(infoAfter.jackpotPool - infoBefore.jackpotPool).to.equal(amount);
+        });
+
+        it('seedJackpot callable by goldenTicketContract', async function () {
+            const { lottery, nft, alice, mintPrice } = await loadFixture(deployMintSeedFixture);
+            // Minting triggers seedJackpot from the GoldenTicket contract address,
+            // which is set as goldenTicketContract on the lottery
+            const infoBefore = await lottery.getRoundInfo(1);
+
+            await nft.connect(alice).mint({ value: mintPrice });
+
+            const infoAfter = await lottery.getRoundInfo(1);
+            expect(infoAfter.jackpotPool - infoBefore.jackpotPool).to.equal(mintPrice);
+            expect(await nft.totalMinted()).to.equal(1);
+        });
+
+        it('seedJackpot reverts for unauthorized callers', async function () {
+            const { lottery, alice } = await loadFixture(deployMintSeedFixture);
+
+            await expect(
+                lottery.connect(alice).seedJackpot({ value: ethers.parseEther('1') }),
+            ).to.be.revertedWithCustomError(lottery, 'Unauthorized');
         });
     });
 

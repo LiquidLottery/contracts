@@ -124,6 +124,10 @@ contract LiquidLotteryV1 is
     function proposeSetUpkeepInterval(uint256 v)     external onlyAdmin { LotteryViews.proposeSetUpkeepInterval(v); }
     function executeSetUpkeepInterval(uint256 v)     external onlyAdmin { LotteryViews.executeSetUpkeepInterval(v); }
     function setGoldenTicketContract(address a)       external onlyAdmin { LotteryViews.setGoldenTicketContract(a); }
+    function seedJackpot() external payable {
+        if (_msgSender() != owner() && _msgSender() != LotteryViews.goldenTicketContract()) revert Unauthorized();
+        LotteryViews.seedJackpot();
+    }
 
     // ═══════════════════ VIEW (via LotteryViews) ════════════════
     function checkUpkeep(bytes calldata) external view returns (bool n, bytes memory d) { return LotteryViews.checkUpkeep(); }

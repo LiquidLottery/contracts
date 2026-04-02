@@ -4,6 +4,10 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+interface ILotterySeed {
+    function seedJackpot() external payable;
+}
+
 /**
  * @title GoldenTicket
  * @notice 10 founder NFTs for LiquidLottery. Each token earns 1% of all
@@ -15,7 +19,9 @@ contract GoldenTicket is ERC721, Ownable {
     uint256 public constant MAX_SUPPLY = 10;
 
     uint256 public mintPrice;
+    uint256 public mintableSupply;
     uint256 private _totalMinted;
+    uint256 private _publicMinted;
     uint256 private _proceeds;
     string  private _baseTokenURI;
     address public lotteryContract;
@@ -26,6 +32,8 @@ contract GoldenTicket is ERC721, Ownable {
     error TransferFailed();
     error InvalidTokenId();
     error OnlyLottery();
+    error MintableSupplyReached();
+    error ExceedsMaxSupply();
 
     event GoldenTicketAwarded(uint256 indexed tokenId, address indexed winner);
 
@@ -39,11 +47,13 @@ contract GoldenTicket is ERC721, Ownable {
 
     // ── Public mint ──────────────────────────────────────────────
     function mint() external payable {
-        if (_totalMinted >= MAX_SUPPLY)  revert AlreadyMintedOut();
-        if (msg.value < mintPrice)       revert InsufficientPayment();
+        if (_publicMinted >= mintableSupply) revert MintableSupplyReached();
+        if (_totalMinted >= MAX_SUPPLY)      revert AlreadyMintedOut();
+        if (msg.value < mintPrice)           revert InsufficientPayment();
         uint256 tokenId = _totalMinted;
         _totalMinted++;
-        _proceeds += msg.value;
+        _publicMinted++;
+        ILotterySeed(lotteryContract).seedJackpot{value: msg.value}();
         _safeMint(msg.sender, tokenId);
     }
 
@@ -70,6 +80,16 @@ contract GoldenTicket is ERC721, Ownable {
         lotteryContract = addr;
     }
 
+    // ── Admin controls ───────────────────────────────────────────
+    function setMintPrice(uint256 newPrice) external onlyOwner {
+        mintPrice = newPrice;
+    }
+
+    function setMintableSupply(uint256 n) external onlyOwner {
+        if (n > MAX_SUPPLY) revert ExceedsMaxSupply();
+        mintableSupply = n;
+    }
+
     // ── Owner withdraw ───────────────────────────────────────────
     function withdrawProceeds() external onlyOwner {
         uint256 amount = _proceeds;
@@ -91,5 +111,9 @@ contract GoldenTicket is ERC721, Ownable {
     // ── Supply info ──────────────────────────────────────────────
     function totalMinted() external view returns (uint256) {
         return _totalMinted;
+    }
+
+    function publicMinted() external view returns (uint256) {
+        return _publicMinted;
     }
 }
